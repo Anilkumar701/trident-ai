@@ -1,0 +1,8 @@
+{
+  "name": "Trident-AI",
+  "description": "Traffic control operations, autonomous vehicle telemetry, and route optimization dashboard.",
+  "version": "1.0.0",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
