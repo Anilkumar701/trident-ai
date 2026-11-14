@@ -2,10 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   advanceSignal,
+  advanceSignalWithStrategy,
+  chooseNextRoad,
   createSignalState,
   overrideSignal,
   computeNextVehicleState,
   interpolateSegment,
+  type GridRoad,
   type Vehicle,
 } from './trafficSimulation'
 
@@ -159,3 +162,72 @@ test('interpolateSegment calculates 2D position and lane offset correctly', () =
   assert.equal(midpoint.angleDeg, 0)
   assert.equal(midpoint.headingDeg, -90)
 })
+
+test('advanceSignalWithStrategy preempts signal immediately for V2X emergency approach', () => {
+  const signal = createSignalState('INT-V2X', 'green', 8, 12, 3) // EW is currently red
+  const updated = advanceSignalWithStrategy(
+    signal,
+    {
+      nsQueue: 3,
+      ewQueue: 1,
+      emergencyNS: false,
+      emergencyEW: true,
+      strategy: 'v2x_emergency',
+    },
+    0.5,
+  )
+
+  assert.equal(updated.isOverridden, true)
+  assert.equal(updated.ewColor, 'green')
+  assert.equal(updated.nsColor, 'red')
+})
+
+test('advanceSignalWithStrategy shortens empty green lane early under Webster AI', () => {
+  const signal = createSignalState('INT-WEB', 'green', 9, 12, 3)
+  const updated = advanceSignalWithStrategy(
+    signal,
+    {
+      nsQueue: 0,
+      ewQueue: 5,
+      emergencyNS: false,
+      emergencyEW: false,
+      strategy: 'webster_ai',
+    },
+    1.1,
+  )
+
+  assert.equal(updated.nsColor, 'yellow')
+  assert.equal(updated.ewColor, 'red')
+})
+
+test('chooseNextRoad avoids hazardous roads under Webster AI strategy', () => {
+  const hazardousRoad: GridRoad = {
+    id: 'A->B',
+    from: 'A',
+    to: 'B',
+    fromName: 'A',
+    toName: 'B',
+    lengthMeters: 500,
+    lanes: 2,
+    speedLimitKmh: 50,
+    hazard: { type: 'Waterlogging', penalty: 0.6 },
+  }
+  const clearRoad: GridRoad = {
+    id: 'A->C',
+    from: 'A',
+    to: 'C',
+    fromName: 'A',
+    toName: 'C',
+    lengthMeters: 500,
+    lanes: 2,
+    speedLimitKmh: 50,
+  }
+  const loads = new Map<string, number>([
+    ['A->B', 2],
+    ['A->C', 1],
+  ])
+
+  const picked = chooseNextRoad([hazardousRoad, clearRoad], loads, 'webster_ai', false)
+  assert.equal(picked?.id, 'A->C')
+})
+

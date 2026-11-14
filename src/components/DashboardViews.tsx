@@ -1,33 +1,28 @@
 import { useState } from 'react'
 import {
   Activity,
-  AlertTriangle,
-  CarFront,
-  Clock,
   Compass,
   Cpu,
   Eye,
-  Navigation,
   RotateCcw,
   Siren,
   Sliders,
-  Truck,
   Volume2,
   VolumeX,
-  Waves,
-  Zap,
   MapPin,
 } from 'lucide-react'
 import { useDashboard } from '../context/DashboardContext'
-import {
-  type DrivingFSMState,
-  type IntersectionKey,
-} from '../lib/metropolisLogic'
+import { type IntersectionKey } from '../lib/metropolisLogic'
 import { TrafficGridMap } from './map/TrafficGridMap'
 import { GoogleTrafficMap } from './map/GoogleTrafficMap'
 import { CitizenReportingEngine } from './CitizenReportingEngine'
 import { OverheadGridMapView } from '../views/OverheadGridMapView'
 import { FieldVisionEngine } from './vision/FieldVisionEngine'
+import { PedestrianFleetSimulator } from './simulations/PedestrianFleetSimulator'
+import { SmartFleetWasteSimulator } from './simulations/SmartFleetWasteSimulator'
+import { FloodAnalyticsSimulator } from './simulations/FloodAnalyticsSimulator'
+import { TrafficGridShowcase } from './simulations/TrafficGridShowcase'
+import { HardwareBridgeHub } from './simulations/HardwareBridgeHub'
 
 export function DashboardViews() {
   const { activeTab } = useDashboard()
@@ -47,6 +42,8 @@ export function DashboardViews() {
       return <SmartWasteView />
     case 'flood':
       return <FloodAnalyticsView />
+    case 'hardware':
+      return <HardwareBridgeHub />
     default:
       return <TrafficControlView />
   }
@@ -506,574 +503,26 @@ function CitizenReportingView() {
 /* TAB: REAL-TIME TRAFFIC GRID SIMULATION (D3.JS)                            */
 /* ========================================================================= */
 function TrafficSimulationView() {
-  const { visionStream, simulateSirenEvent, clearSirenEvent } = useDashboard()
-  const [activeScenario, setActiveScenario] = useState<string>('Standard Multi-Corridor Flow')
-
-  return (
-    <div className="space-y-5">
-      {/* Simulation Command & Scenario Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-cyan-500/30 bg-cyan-950/60 text-cyan-400">
-            <Activity className="h-5 w-5 animate-pulse" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-xs font-bold text-cyan-400 uppercase tracking-wider">
-                D3.JS REAL-TIME TRAFFIC GRID SIMULATION
-              </span>
-              <span className="rounded border border-emerald-500/40 bg-emerald-950/60 px-2 py-0.5 font-mono text-[10px] text-emerald-300 uppercase">
-                60 FPS KINEMATICS ENGINE
-              </span>
-            </div>
-            <p className="text-xs text-slate-400">
-              Active Scenario: <strong className="text-slate-200">{activeScenario}</strong> · Real-time multi-agent vehicle movement, signal interlocking &amp; dynamic routing
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setActiveScenario('Priority Emergency Green Wave')
-              simulateSirenEvent('Silk Board')
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-1.5 font-mono text-xs font-semibold text-rose-300 hover:bg-rose-900/60 transition"
-          >
-            <Siren className="h-3.5 w-3.5" />
-            Ambulance Green Wave
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveScenario('Peak Hour Traffic Surge (+25 Veh)')
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-950/40 px-3 py-1.5 font-mono text-xs font-semibold text-amber-300 hover:bg-amber-900/60 transition"
-          >
-            <CarFront className="h-3.5 w-3.5" />
-            Peak Rush Surge
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveScenario('Monsoon Road Hazards & Waterlogging')
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-950/40 px-3 py-1.5 font-mono text-xs font-semibold text-cyan-300 hover:bg-cyan-900/60 transition"
-          >
-            <Waves className="h-3.5 w-3.5" />
-            Monsoon Hazards
-          </button>
-          {visionStream.ambulancePresent && (
-            <button
-              type="button"
-              onClick={clearSirenEvent}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 font-mono text-xs font-semibold text-slate-300 hover:bg-slate-700 transition"
-            >
-              Reset Siren
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Main Interactive D3 Simulation Grid */}
-      <TrafficGridMap tall />
-    </div>
-  )
+  return <TrafficGridShowcase />
 }
 
 /* ========================================================================= */
 /* TAB 3: PEDESTRIAN & FLEET HUB (AV TELEMETRY & 5-STATE FSM)                */
 /* ========================================================================= */
 function PedestrianFleetHubView() {
-  const {
-    telemetry,
-    fsmState,
-    accidentProneWarning,
-    isVulnerablePedestrianPresent,
-    toggleVulnerablePedestrian,
-    crossingWindow,
-    injectObstacle,
-    triggerPedestrianWalkway,
-    accelerateEgoCar,
-    resetTelemetry,
-  } = useDashboard()
-
-  const fsmStates: DrivingFSMState[] = [
-    'CRUISE',
-    'FOLLOW',
-    'AVOID',
-    'YIELD',
-    'EMERGENCY_BRAKE',
-  ]
-
-  return (
-    <div className="space-y-5">
-      {/* Critical Accident Prone Area Trip Banner */}
-      {accidentProneWarning.isAccidentProne ? (
-        <div className="relative overflow-hidden rounded-xl border-2 border-rose-500 bg-rose-950/80 p-4 shadow-[0_0_30px_rgba(244,63,94,0.4)]">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-rose-600 text-white animate-bounce">
-                <AlertTriangle className="h-6 w-6" />
-              </div>
-              <div>
-                <p className="font-mono text-xs font-bold tracking-widest text-rose-300 uppercase">
-                  {accidentProneWarning.reason}
-                </p>
-                <p className="text-xs text-rose-200">
-                  Autonomous Vehicle Trajectory Planner engaged override deceleration bounds.
-                </p>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={resetTelemetry}
-              className="rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-500 transition"
-            >
-              Reset Telemetry Vector
-            </button>
-          </div>
-        </div>
-      ) : null}
-
-      {/* 5-State Finite State Machine Bar */}
-      <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Cpu className="h-4 w-4 text-cyan-400" />
-            <h3 className="font-bold text-sm text-slate-100">
-              AUTONOMOUS VEHICLE 5-STATE FINITE STATE MACHINE (FSM)
-            </h3>
-          </div>
-          <span className="font-mono text-xs text-slate-400">
-            Current State: <span className="font-bold text-cyan-300">{fsmState}</span>
-          </span>
-        </div>
-
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-          {fsmStates.map((st) => {
-            const isActive = fsmState === st
-            return (
-              <div
-                key={st}
-                className={`rounded-lg border p-3 text-center transition-all ${
-                  isActive
-                    ? st === 'EMERGENCY_BRAKE'
-                      ? 'border-rose-500 bg-rose-950/70 text-rose-200 shadow-[0_0_15px_rgba(244,63,94,0.4)]'
-                      : st === 'YIELD'
-                        ? 'border-amber-500 bg-amber-950/70 text-amber-200 shadow-[0_0_15px_rgba(245,158,11,0.4)]'
-                        : st === 'AVOID'
-                          ? 'border-orange-500 bg-orange-950/70 text-orange-200 shadow-[0_0_15px_rgba(249,115,22,0.4)]'
-                          : 'border-emerald-500 bg-emerald-950/70 text-emerald-200 shadow-[0_0_15px_rgba(16,185,129,0.4)]'
-                    : 'border-slate-800 bg-slate-950/50 text-slate-500'
-                }`}
-              >
-                <div
-                  className={`h-2 w-2 rounded-full mx-auto mb-1.5 ${
-                    isActive ? 'bg-current animate-ping' : 'bg-slate-700'
-                  }`}
-                />
-                <span className="font-mono text-xs font-bold block">{st}</span>
-              </div>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* Real-time Telemetry Metrics Grid */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">EGO VEHICLE SPEED</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-slate-100">
-              {telemetry.egoSpeedKmh}
-            </span>
-            <span className="font-mono text-xs text-slate-400">km/h</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">OBSTACLE DISTANCE</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-cyan-400">
-              {telemetry.distanceM}
-            </span>
-            <span className="font-mono text-xs text-slate-400">meters</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">CLOSING VELOCITY</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-amber-400">
-              {telemetry.closingVelMs}
-            </span>
-            <span className="font-mono text-xs text-slate-400">m/s</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">TIME-TO-COLLISION (TTC)</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span
-              className={`font-mono text-3xl font-bold ${
-                telemetry.ttcSec < 2.0 ? 'text-rose-400 animate-pulse' : 'text-emerald-400'
-              }`}
-            >
-              {telemetry.ttcSec}
-            </span>
-            <span className="font-mono text-xs text-slate-400">sec</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Pedestrian Crossing Window Widget (+15s Buffer) & Hazard Stream Controls */}
-      <div className="grid gap-5 lg:grid-cols-2">
-        {/* Dynamic Pedestrian Crossing Clearance Widget */}
-        <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
-              <Navigation className="h-4 w-4 text-emerald-400" />
-              DYNAMIC PEDESTRIAN CROSSING CLEARANCE WIDGET
-            </h3>
-            <span
-              className={`font-mono text-xs px-2 py-0.5 rounded ${
-                crossingWindow.isExtended
-                  ? 'border border-amber-500/40 bg-amber-950/60 text-amber-300'
-                  : 'border border-slate-700 bg-slate-800 text-slate-300'
-              }`}
-            >
-              {crossingWindow.isExtended ? '+15s BUFFER ACTIVE' : 'STANDARD WINDOW'}
-            </span>
-          </div>
-
-          <p className="text-xs text-slate-400">
-            Dynamically recalculates safe zebra crossing green phase duration. When vulnerable, elderly, or crowded pedestrian groups are detected, the system appends a +15 second clearance buffer.
-          </p>
-
-          <div className="flex items-center justify-between rounded-lg bg-slate-950 p-4 border border-slate-800">
-            <div>
-              <span className="font-mono text-xs text-slate-400 block">
-                CALCULATED CROSSING TIME
-              </span>
-              <span className="font-mono text-2xl font-bold text-emerald-400">
-                {crossingWindow.totalSeconds} Seconds
-              </span>
-              <span className="font-mono text-[11px] text-slate-500 block mt-0.5">
-                Base: 25s · Extension: +{crossingWindow.bufferAppliedSeconds}s
-              </span>
-            </div>
-
-            <button
-              type="button"
-              onClick={toggleVulnerablePedestrian}
-              className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition ${
-                isVulnerablePedestrianPresent
-                  ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                  : 'border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200'
-              }`}
-            >
-              {isVulnerablePedestrianPresent
-                ? 'Dismiss Vulnerable Pedestrian Group'
-                : 'Flag Vulnerable / Elderly Group (+15s)'}
-            </button>
-          </div>
-        </div>
-
-        {/* Hazard Stream Simulator Injections */}
-        <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
-              <Zap className="h-4 w-4 text-cyan-400" />
-              ROAD SURFACE HAZARD SIMULATOR STREAM
-            </h3>
-            <span className="font-mono text-xs text-slate-400">Interactive Telemetry Controls</span>
-          </div>
-
-          <p className="text-xs text-slate-400">
-            Inject real-world road defects and obstacle vectors to observe the autonomous vehicle's FSM state transitions and TTC emergency braking in real-time.
-          </p>
-
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => injectObstacle('pothole')}
-              className="rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700/80 px-3 py-2 text-xs font-medium text-slate-200 transition"
-            >
-              Inject Pothole (AVOID)
-            </button>
-            <button
-              type="button"
-              onClick={() => injectObstacle('manhole')}
-              className="rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700/80 px-3 py-2 text-xs font-medium text-slate-200 transition"
-            >
-              Inject Open Manhole (AVOID)
-            </button>
-            <button
-              type="button"
-              onClick={triggerPedestrianWalkway}
-              className="rounded-lg border border-amber-500/40 bg-amber-950/30 hover:bg-amber-900/40 px-3 py-2 text-xs font-medium text-amber-200 transition"
-            >
-              Pedestrian in Lane (YIELD)
-            </button>
-            <button
-              type="button"
-              onClick={accelerateEgoCar}
-              className="rounded-lg border border-rose-500/40 bg-rose-950/30 hover:bg-rose-900/40 px-3 py-2 text-xs font-medium text-rose-200 transition"
-            >
-              Rapid Acceleration (EMERGENCY BRAKE)
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
+  return <PedestrianFleetSimulator />
 }
 
 /* ========================================================================= */
 /* TAB 4: GEOSPATIAL SMART WASTE                                             */
 /* ========================================================================= */
 function SmartWasteView() {
-  const { geoLocation, wasteEcosystem, reportMissedPickup, flagWasteOverflow } = useDashboard()
-
-  return (
-    <div className="space-y-5">
-      {/* Primary Operations Header with Unified Geolocation API Info */}
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-950 text-emerald-400">
-            <Truck className="h-5 w-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-xs font-bold text-emerald-400 uppercase tracking-wider">
-                MUNICIPAL SMART FLEET OPERATIONS
-              </span>
-              <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-300">
-                {geoLocation.city} Urban Division
-              </span>
-            </div>
-            <p className="font-mono text-xs text-slate-400">
-              Operational Base: {geoLocation.area} · Coords: [Lat: {geoLocation.lat}°, Lng: {geoLocation.lng}°] · Precision: ±{geoLocation.accuracy}m
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-4 font-mono text-xs">
-          <div className="rounded-lg bg-slate-950 px-3 py-1.5 border border-slate-800">
-            <span className="text-slate-500 block text-[10px]">ACTIVE TRUCKS</span>
-            <span className="font-bold text-slate-200">{wasteEcosystem.activeTrucks} units</span>
-          </div>
-          <div className="rounded-lg bg-slate-950 px-3 py-1.5 border border-slate-800">
-            <span className="text-slate-500 block text-[10px]">ROUTE EFFICIENCY</span>
-            <span className="font-bold text-emerald-400">{wasteEcosystem.routeEfficiencyScore}%</span>
-          </div>
-          <div className="rounded-lg bg-slate-950 px-3 py-1.5 border border-slate-800">
-            <span className="text-slate-500 block text-[10px]">TOTAL COLLECTED</span>
-            <span className="font-bold text-cyan-400">{wasteEcosystem.wasteWeightCollectedTons} Tons</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Smart Bin Monitoring Grid & Actions */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-        {wasteEcosystem.collectionNodes.map((bin) => {
-          const isOverflow = bin.status === 'Overflow Flagged'
-          const isNearCapacity = bin.status === 'Near Capacity'
-
-          return (
-            <div
-              key={bin.id}
-              className={`rounded-xl border p-4 space-y-3 transition ${
-                isOverflow
-                  ? 'border-rose-500 bg-rose-950/40'
-                  : isNearCapacity
-                    ? 'border-amber-500/60 bg-amber-950/20'
-                    : 'border-slate-800 bg-slate-900/60'
-              }`}
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-xs font-bold text-cyan-400">{bin.id}</span>
-                <span
-                  className={`rounded-full px-2 py-0.5 font-mono text-[9px] uppercase font-semibold ${
-                    isOverflow
-                      ? 'border border-rose-500/40 bg-rose-900/60 text-rose-200'
-                      : isNearCapacity
-                        ? 'border border-amber-500/40 bg-amber-900/60 text-amber-200'
-                        : 'border border-emerald-500/40 bg-emerald-900/60 text-emerald-200'
-                  }`}
-                >
-                  {bin.status}
-                </span>
-              </div>
-
-              <div>
-                <p className="font-bold text-xs text-slate-200">{bin.locationName}</p>
-                <p className="font-mono text-[10px] text-slate-500">{bin.zone}</p>
-              </div>
-
-              {/* Fill Level Progress Bar */}
-              <div>
-                <div className="flex justify-between font-mono text-[10px] text-slate-400 mb-1">
-                  <span>Fill Level</span>
-                  <span className="font-bold text-slate-200">{bin.fillLevelPercent}%</span>
-                </div>
-                <div className="h-2 w-full rounded-full bg-slate-950 overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-500 ${
-                      bin.fillLevelPercent > 90
-                        ? 'bg-rose-500'
-                        : bin.fillLevelPercent > 70
-                          ? 'bg-amber-400'
-                          : 'bg-emerald-500'
-                    }`}
-                    style={{ width: `${bin.fillLevelPercent}%` }}
-                  />
-                </div>
-              </div>
-
-              <div className="flex items-center gap-1.5 pt-1">
-                <button
-                  type="button"
-                  onClick={() => reportMissedPickup(bin.id)}
-                  className="flex-1 rounded border border-slate-700 bg-slate-800 hover:bg-slate-700 py-1 text-[10px] font-semibold text-slate-300 transition"
-                >
-                  Missed Pick-up
-                </button>
-                <button
-                  type="button"
-                  onClick={() => flagWasteOverflow(bin.id)}
-                  className="flex-1 rounded border border-rose-500/40 bg-rose-950/40 hover:bg-rose-900/60 py-1 text-[10px] font-semibold text-rose-300 transition"
-                >
-                  Flag Overflow
-                </button>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      {/* Autonomous Dispatch & Optimization Activity Log */}
-      <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 space-y-3">
-        <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
-          <Clock className="h-4 w-4 text-cyan-400" />
-          AUTONOMOUS DISPATCH & ROUTE OPTIMIZATION ACTIVITY LOG
-        </h3>
-
-        <div className="space-y-2">
-          {wasteEcosystem.routingLogs.map((log) => (
-            <div
-              key={log.id}
-              className="flex items-center gap-3 rounded-lg bg-slate-950 p-2.5 font-mono text-xs border border-slate-800/80"
-            >
-              <span className="text-cyan-400 font-bold shrink-0">{log.timestamp}</span>
-              <span className="text-slate-300">{log.log}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
+  return <SmartFleetWasteSimulator />
 }
 
 /* ========================================================================= */
 /* TAB 5: FLOOD & VIDEO ANALYTICS MONITOR                                    */
 /* ========================================================================= */
 function FloodAnalyticsView() {
-  const { visionStream, floodTelemetry } = useDashboard()
-
-  const underpassCameras = [
-    { id: 'CAM-FL-01', name: 'Majestic City Railway Underpass', depth: floodTelemetry.underpassDepthCm, status: 'NORMAL' },
-    { id: 'CAM-FL-02', name: 'Koramangala 80ft Storm Canal', depth: 22.1, status: 'ELEVATED' },
-    { id: 'CAM-FL-03', name: 'Silk Board South Flyover Incline', depth: 14.2, status: 'OPTIMAL' },
-    { id: 'CAM-FL-04', name: 'Bellandur Lake Spillway Gate', depth: 31.8, status: 'MONITORING' },
-  ]
-
-  return (
-    <div className="space-y-5">
-      <FieldVisionEngine />
-      {/* Stream Metrics Header */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">BOUND INFERENCE FPS</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-emerald-400">
-              {visionStream.fps}
-            </span>
-            <span className="font-mono text-xs text-slate-500">target 45–50 FPS</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">TOTAL VEHICLES ENUMERATED</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-slate-100">
-              {visionStream.activeCars + visionStream.activeBikes + visionStream.activeTrucks}
-            </span>
-            <span className="font-mono text-xs text-slate-400">active targets</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">TRAFFIC DELAY MINIMIZATION</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-3xl font-bold text-cyan-400">
-              {floodTelemetry.delayMinimizationPercent}%
-            </span>
-            <span className="font-mono text-xs text-slate-400">vs fixed timer baseline</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <span className="font-mono text-xs text-slate-400 block">STORMWATER PUMP STATUS</span>
-          <div className="flex items-baseline gap-2 mt-1">
-            <span className="font-mono text-xl font-bold text-emerald-400">
-              {floodTelemetry.drainagePumpStatus}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Underpass Water Depth Telemetry Grid */}
-      <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-          <div className="flex items-center gap-2">
-            <Waves className="h-4 w-4 text-cyan-400" />
-            <h3 className="font-bold text-sm text-slate-100">
-              MONSOON FLOOD & UNDERPASS WATER DEPTH SENSOR TELEMETRY
-            </h3>
-          </div>
-          <span className="font-mono text-xs text-slate-400">
-            Sensor Accuracy: {floodTelemetry.sensorAccuracyPercent}%
-          </span>
-        </div>
-
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {underpassCameras.map((node) => (
-            <div
-              key={node.id}
-              className="rounded-lg border border-slate-800 bg-slate-950 p-4 space-y-2"
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-xs text-cyan-400 font-bold">{node.id}</span>
-                <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[9px] text-slate-300">
-                  {node.status}
-                </span>
-              </div>
-              <h4 className="font-semibold text-xs text-slate-200">{node.name}</h4>
-              <div className="pt-2">
-                <span className="text-[10px] font-mono text-slate-400 block">WATER LEVEL</span>
-                <span className="font-mono text-2xl font-bold text-slate-100">
-                  {node.depth} cm
-                </span>
-                <span className="text-[10px] text-slate-500 block">Threshold Limit: 45 cm</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
+  return <FloodAnalyticsSimulator />
 }

@@ -81,7 +81,7 @@ export function FieldVisionEngine() {
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current
-    const host = canvas.parentElement
+    const host = canvas?.parentElement
     if (!canvas || !host) return
     const w = host.clientWidth || canvas.clientWidth
     const h = host.clientHeight || canvas.clientHeight
@@ -429,6 +429,9 @@ export function FieldVisionEngine() {
             <FlipHorizontal2 className="h-3.5 w-3.5" />
             Mirror fix: {correctMirror ? 'ON' : 'OFF'}
           </button>
+          <button
+            type="button"
+            onClick={() => imageRef.current?.click()}
             className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700"
           >
             <ImageIcon className="h-3.5 w-3.5" />

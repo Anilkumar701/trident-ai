@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   APIProvider,
   Map,
@@ -23,6 +23,8 @@ import {
   Truck,
   Gauge,
 } from 'lucide-react';
+import { GmpCircle } from '../components/map/GmpPrimitives';
+import { computeBearingDeg, interpolateGeoPath } from '../lib/geoCorridors';
 
 export interface AutonomousVehicle {
   id: string;
@@ -263,8 +265,16 @@ function FollowCamera({ target }: { target: { lat: number; lng: number } | null 
 }
 
 export function OverheadGridMapView() {
-  const { intersections, visionStream, geoLocation, triggerEmergencyOverride, resetIntersectionOverride } = useDashboard();
-  const apiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '';
+  const {
+    intersections,
+    visionStream,
+    geoLocation,
+    triggerEmergencyOverride,
+    resetIntersectionOverride,
+    simulateSirenEvent,
+    clearSirenEvent,
+  } = useDashboard()
+  const apiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || ''
 
   const [fleet, setFleet] = useState<AutonomousVehicle[]>(INITIAL_FLEET);
   const [incidents, setIncidents] = useState<GridIncident[]>(INITIAL_INCIDENTS);
@@ -321,7 +331,20 @@ export function OverheadGridMapView() {
     fetchDbIncidents();
   }, []);
 
-  // Smooth real-time kinematics simulation loop for AV fleet
+  // Smooth multi-waypoint kinematics loop along real Bengaluru road corridors
+  const avProgressRef = useRef<Record<string, number>>({
+    'av-01': 0.35,
+    'av-02': 0.45,
+    'av-03': 0.5,
+    'av-04': 0.4,
+  });
+  const avDirRef = useRef<Record<string, 1 | -1>>({
+    'av-01': 1,
+    'av-02': 1,
+    'av-03': 1,
+    'av-04': 1,
+  });
+
   useEffect(() => {
     const interval = setInterval(() => {
       setFleet((prevFleet) =>
@@ -334,55 +357,61 @@ export function OverheadGridMapView() {
             };
           }
 
-          // Advance vehicle along trajectory towards target coordinates
-          const dLat = av.targetLat - av.lat;
-          const dLng = av.targetLng - av.lng;
-          const dist = Math.hypot(dLat, dLng);
-
-          // If reached target, reverse trajectory or set new destination
-          if (dist < 0.002) {
-            const nextTargetLat = av.path[0].lat === av.targetLat ? av.path[av.path.length - 1].lat : av.path[0].lat;
-            const nextTargetLng = av.path[0].lng === av.targetLng ? av.path[av.path.length - 1].lng : av.path[0].lng;
-            return {
-              ...av,
-              targetLat: nextTargetLat,
-              targetLng: nextTargetLng,
-              heading: (av.heading + 180) % 360,
-            };
+          const dir = avDirRef.current[av.id] ?? 1;
+          const step = Math.max(0.004, (av.speedKmh / 60) * 0.015);
+          let p = (avProgressRef.current[av.id] ?? 0.25) + dir * step;
+          if (p >= 0.98) {
+            p = 0.98;
+            avDirRef.current[av.id] = -1;
+          } else if (p <= 0.02) {
+            p = 0.02;
+            avDirRef.current[av.id] = 1;
           }
+          avProgressRef.current[av.id] = p;
 
-          // Step coordinates proportional to speed
-          const step = (av.speedKmh / 3600) * 0.0003;
-          const latStep = (dLat / dist) * step;
-          const lngStep = (dLng / dist) * step;
+          const sample = interpolateGeoPath(av.path, p);
+          const nextLook = interpolateGeoPath(
+            av.path,
+            Math.min(0.999, Math.max(0.001, p + (avDirRef.current[av.id] ?? 1) * 0.02)),
+          );
+          const heading = Math.round(computeBearingDeg(sample.point, nextLook.point));
 
-          // Minor sensor distance fluctuations
-          const lidarDelta = (Math.random() - 0.5) * 1.5;
-          const newLidar = Math.max(8.0, Math.min(80.0, av.lidarDistanceM + lidarDelta));
+          // Detect proximity to any active urban bottleneck or hazard (~450m)
+          const nearIncident = incidents.find((inc) => {
+            const d = Math.hypot(inc.lat - sample.point.lat, inc.lng - sample.point.lng);
+            return d < 0.0045;
+          });
 
-          // Check if vehicle is near any incident
-          let state = av.fsmState;
-          if (newLidar < 15.0) {
-            state = 'YIELD';
-          } else if (newLidar < 25.0) {
-            state = 'AVOID';
-          } else if (av.speedKmh > 35) {
+          const lidarDelta = (Math.random() - 0.5) * 1.4;
+          const newLidar = nearIncident
+            ? Math.max(9.5, Math.min(18.0, av.lidarDistanceM - 1.2))
+            : Math.max(14.0, Math.min(72.0, av.lidarDistanceM + lidarDelta));
+
+          let state: AutonomousVehicle['fsmState'] = av.fsmState;
+          let speed = av.speedKmh;
+          if (nearIncident || newLidar < 15.0) {
+            state = nearIncident ? 'AVOID' : 'YIELD';
+            speed = Math.max(18, Math.min(30, av.speedKmh));
+          } else {
             state = 'CRUISE';
+            speed = Math.min(54, Math.max(34, av.speedKmh + 1));
           }
 
           return {
             ...av,
-            lat: av.lat + latStep,
-            lng: av.lng + lngStep,
+            lat: sample.point.lat,
+            lng: sample.point.lng,
+            heading,
+            speedKmh: speed,
             lidarDistanceM: parseFloat(newLidar.toFixed(1)),
             fsmState: state,
           };
-        })
+        }),
       );
-    }, 1000);
+    }, 350);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [incidents]);
 
   // Emergency brake trigger for whole fleet
   const handleEmergencyStopAll = useCallback(() => {
@@ -570,6 +599,25 @@ export function OverheadGridMapView() {
 
             <button
               type="button"
+              onClick={() =>
+                visionStream.ambulancePresent
+                  ? clearSirenEvent()
+                  : simulateSirenEvent('Silk Board')
+              }
+              className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 font-semibold transition shadow-sm ${
+                visionStream.ambulancePresent
+                  ? 'border-emerald-400 bg-emerald-600 text-white'
+                  : 'border-emerald-500/50 bg-emerald-950/50 text-emerald-300 hover:bg-emerald-900/70'
+              }`}
+            >
+              <Siren className="h-3.5 w-3.5" />
+              <span>
+                {visionStream.ambulancePresent ? 'Clear Emergency Wave' : 'EMR-108 Green Wave Demo'}
+              </span>
+            </button>
+
+            <button
+              type="button"
               onClick={handleEmergencyStopAll}
               className="flex items-center gap-1.5 rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-1.5 font-bold text-rose-300 hover:bg-rose-900/80 transition shadow-sm"
             >
@@ -724,38 +772,48 @@ export function OverheadGridMapView() {
                     </AdvancedMarker>
                   ))}
 
-                {/* Bangalore Arterial Intersection Pins */}
+                {/* Bangalore Arterial Intersection Pins & Signal Wave Rings */}
                 {(Object.keys(INTERSECTION_NODES) as IntersectionKey[]).map((key) => {
                   const node = INTERSECTION_NODES[key];
                   const info = intersections[key];
                   const isGreen = info?.mode === 'EMERGENCY_GREEN';
 
                   return (
-                    <AdvancedMarker
-                      key={`node-${key}`}
-                      position={node}
-                      title={`${node.label} [${info?.mode || 'NORMAL'}]`}
-                      onClick={() => {
-                        setSelectedIntersection(key);
-                        setSelectedVehicleId(null);
-                        setSelectedIncident(null);
-                      }}
-                    >
-                      <div
-                        className={`flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[10px] shadow-md transition-all ${
-                          isGreen
-                            ? 'border-emerald-400 bg-emerald-950 text-emerald-300 animate-pulse'
-                            : 'border-slate-700 bg-slate-900/90 text-slate-300'
-                        }`}
+                    <span key={`wrap-${key}`}>
+                      <GmpCircle
+                        center={node}
+                        radiusMeters={isGreen ? 900 : 350 + (info?.queueLengthVehicles ?? 15) * 9}
+                        color={isGreen ? '#10b981' : (info?.densityPercent ?? 50) >= 80 ? '#f43f5e' : '#0ea5e9'}
+                        fillOpacity={isGreen ? 0.2 : 0.11}
+                        strokeWeight={isGreen ? 2 : 1}
+                      />
+                      <AdvancedMarker
+                        key={`node-${key}`}
+                        position={node}
+                        title={`${node.label} [${info?.mode || 'NORMAL'}]`}
+                        onClick={() => {
+                          setSelectedIntersection(key);
+                          setSelectedVehicleId(null);
+                          setSelectedIncident(null);
+                        }}
                       >
-                        <span
-                          className={`h-2 w-2 rounded-full ${
-                            isGreen ? 'bg-emerald-400' : 'bg-cyan-400'
+                        <div
+                          className={`flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono text-[10px] shadow-md transition-all cursor-pointer ${
+                            isGreen
+                              ? 'border-emerald-400 bg-emerald-950 text-emerald-300 animate-pulse'
+                              : 'border-slate-700 bg-slate-900/95 text-slate-200'
                           }`}
-                        />
-                        <span className="font-semibold">{key}</span>
-                      </div>
-                    </AdvancedMarker>
+                        >
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              isGreen ? 'bg-emerald-400' : 'bg-cyan-400'
+                            }`}
+                          />
+                          <span className="font-semibold">{key}</span>
+                          <span className="text-emerald-300 tabular-nums">{info?.activeGreenSeconds}s</span>
+                        </div>
+                      </AdvancedMarker>
+                    </span>
                   );
                 })}
 

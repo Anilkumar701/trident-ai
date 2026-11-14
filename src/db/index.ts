@@ -9,10 +9,21 @@ declare global {
   var _postgresPool: pg.Pool | undefined;
 }
 
-export function createPool(): pg.Pool {
+export const isDatabaseConfigured = Boolean(
+  process.env.DATABASE_URL ||
+    (process.env.SQL_HOST &&
+      process.env.SQL_DB_NAME &&
+      (Boolean(process.env.SQL_PASSWORD) || process.env.SQL_HOST.startsWith('/')))
+);
+
+export function createPool(): pg.Pool | null {
+  if (!isDatabaseConfigured) {
+    return null;
+  }
   if (!globalThis._postgresPool) {
     const isSocket = process.env.SQL_HOST?.startsWith('/');
     globalThis._postgresPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
       host: process.env.SQL_HOST || '127.0.0.1',
       port: isSocket ? undefined : (process.env.SQL_PORT ? parseInt(process.env.SQL_PORT, 10) : 5432),
       user: process.env.SQL_USER,
@@ -31,4 +42,38 @@ export function createPool(): pg.Pool {
 }
 
 export const pool = createPool();
-export const db = drizzle(pool, { schema });
+
+let db: ReturnType<typeof drizzle<typeof schema>>;
+if (pool) {
+  try {
+    db = drizzle(pool, { schema });
+  } catch {
+    console.log('[AI Studio] Database initialization failed — using in-memory fallback store');
+    const noOp = {
+      findMany: async () => [],
+      findFirst: async () => null,
+      findUnique: async () => null,
+      create: async (d: { data?: unknown }) => d?.data ?? {},
+      update: async (d: { data?: unknown }) => d?.data ?? {},
+      delete: async () => ({}),
+    };
+    db = new Proxy({} as ReturnType<typeof drizzle<typeof schema>>, {
+      get: (_, prop) => (prop === 'query' ? new Proxy({}, { get: () => noOp }) : async () => []),
+    });
+  }
+} else {
+  console.log('[AI Studio] Database not provisioned — using in-memory fallback store');
+  const noOp = {
+    findMany: async () => [],
+    findFirst: async () => null,
+    findUnique: async () => null,
+    create: async (d: { data?: unknown }) => d?.data ?? {},
+    update: async (d: { data?: unknown }) => d?.data ?? {},
+    delete: async () => ({}),
+  };
+  db = new Proxy({} as ReturnType<typeof drizzle<typeof schema>>, {
+    get: (_, prop) => (prop === 'query' ? new Proxy({}, { get: () => noOp }) : async () => []),
+  });
+}
+
+export { db };

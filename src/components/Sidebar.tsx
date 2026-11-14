@@ -8,6 +8,7 @@ import {
   Radio,
   Shield,
   TrafficCone,
+  Usb,
   Waves,
   Navigation2,
   X,
@@ -93,10 +94,19 @@ const NAVIGATION_ITEMS: NavItem[] = [
     badgeTone: 'rose',
     icon: Waves,
   },
+  {
+    id: 'hardware',
+    label: 'Arduino & Mic Bridge',
+    sectorCode: 'HW-01',
+    subtitle: 'USB UNO, Gas, Touch & Sound',
+    badgeText: 'USB + MIC',
+    badgeTone: 'emerald',
+    icon: Usb,
+  },
 ]
 
 export function Sidebar({ mobileOpen = false, onMobileClose }: SidebarProps) {
-  const { activeTab, setActiveTab, visionStream, hardwareLink } = useDashboard()
+  const { activeTab, setActiveTab, visionStream, hardwareLink, hardwareBridge } = useDashboard()
 
   const handleTabClick = (tabId: SectorTab) => {
     setActiveTab(tabId)
@@ -257,36 +267,52 @@ export function Sidebar({ mobileOpen = false, onMobileClose }: SidebarProps) {
 
         {/* Autonomous Telemetry Hardware Status Card */}
         <div className="border-t border-slate-800/80 p-3.5 bg-slate-950/80">
-          <div className="rounded-xl border border-slate-800/80 bg-slate-900/60 p-3 space-y-2">
+          <button
+            type="button"
+            onClick={() => handleTabClick('hardware')}
+            className={`w-full text-left rounded-xl border p-3 space-y-2 transition ${
+              activeTab === 'hardware'
+                ? 'border-emerald-500/50 bg-emerald-950/20'
+                : 'border-slate-800/80 bg-slate-900/60 hover:border-slate-700 hover:bg-slate-900'
+            }`}
+          >
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1.5">
                 <Cpu className="h-3.5 w-3.5 text-cyan-400" />
                 <span className="font-mono text-[10px] font-semibold text-slate-300">
-                  AV TELEMETRY HARDWARE
+                  HARDWARE &amp; SENSOR BRIDGE
                 </span>
               </div>
               <span
                 className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded ${
-                  hardwareLink.isLinked
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                  hardwareBridge.arduinoConnected || hardwareBridge.micActive || hardwareLink.isLinked
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                     : 'bg-slate-800 text-slate-400'
                 }`}
               >
-                {hardwareLink.isLinked ? 'LINKED' : 'STANDBY'}
+                {hardwareBridge.arduinoConnected
+                  ? 'UNO USB'
+                  : hardwareBridge.micActive
+                    ? 'MIC LIVE'
+                    : hardwareLink.isLinked
+                      ? 'LINKED'
+                      : 'STANDBY'}
               </span>
             </div>
 
             <p className="font-mono text-[9px] text-slate-400 leading-relaxed truncate">
-              {hardwareLink.statusMessage}
+              {hardwareBridge.arduinoConnected
+                ? `Gas ${hardwareBridge.gasPercent}% · Touch ${hardwareBridge.touchActive ? 'PRESSED' : 'IDLE'} · LED ${hardwareBridge.ledColor}`
+                : hardwareLink.statusMessage}
             </p>
 
             <div className="flex items-center justify-between pt-1 border-t border-slate-800/60 text-[10px] font-mono text-slate-400">
               <span className="flex items-center gap-1">
-                <Radio className="h-3 w-3 text-emerald-400" /> PORT 8000
+                <Radio className="h-3 w-3 text-emerald-400" /> 9600 BAUD / MIC
               </span>
-              <span>INFERENCE: YOLOv11n</span>
+              <span className="text-cyan-400">OPEN BRIDGE &rarr;</span>
             </div>
-          </div>
+          </button>
         </div>
 
         {/* Footer Info */}

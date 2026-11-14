@@ -10,6 +10,13 @@ import {
 } from 'react'
 import { emergencyBuzzer } from '../lib/audioService'
 import {
+  ArduinoSerialClient,
+  isWebSerialSupported,
+  type ArduinoSensorPacket,
+  type LedColorCode,
+} from '../lib/arduinoSerial'
+import { AcousticDetector } from '../lib/acousticDetector'
+import {
   BENGALURU_DEFAULT_COORDS,
   requestNativeLocation,
   watchNativeLocation,
@@ -35,7 +42,52 @@ import {
   type TelemetryState,
 } from '../lib/metropolisLogic'
 
-export type SectorTab = 'traffic' | 'simulation' | 'gridmap' | 'citizen' | 'fleet' | 'waste' | 'flood'
+export type SectorTab =
+  | 'traffic'
+  | 'simulation'
+  | 'gridmap'
+  | 'citizen'
+  | 'fleet'
+  | 'waste'
+  | 'flood'
+  | 'hardware'
+
+export type HardwareTouchMode = 'pedestrian_crosswalk' | 'emergency_sos'
+
+export interface HardwareLogEntry {
+  id: string
+  timestamp: string
+  source: 'ARDUINO' | 'SOUND' | 'OUTPUT'
+  message: string
+}
+
+export interface HardwareBridgeState {
+  serialSupported: boolean
+  arduinoConnected: boolean
+  arduinoConnecting: boolean
+  portLabel: string
+  errorMessage: string | null
+  gasRaw: number
+  gasPercent: number
+  gasThreshold: number
+  gasAlertActive: boolean
+  touchActive: boolean
+  touchMode: HardwareTouchMode
+  touchCount: number
+  ledColor: LedColorCode
+  autoSyncLed: boolean
+  buzzerOn: boolean
+  buzzerMuted: boolean
+  micActive: boolean
+  micLevel: number
+  micPeakHz: number
+  sirenScore: number
+  soundThreshold: number
+  micSpectrum: number[]
+  soundAlertActive: boolean
+  lastPacketRaw: string
+  logs: HardwareLogEntry[]
+}
 
 export interface HazardProfile {
   id: string
@@ -176,6 +228,10 @@ export interface DashboardContextType {
   }
   reportMissedPickup: (nodeId: string) => void
   flagWasteOverflow: (nodeId: string) => void
+  clearWasteNode: (nodeId: string) => void
+  dispatchAutoCollectorFleet: () => void
+  simulateWasteSurge: (mode: 'morning' | 'market') => void
+  tickWasteAutoFill: () => void
 
   // Flood & Underpass Telemetry
   floodTelemetry: {
@@ -184,7 +240,37 @@ export interface DashboardContextType {
     sensorAccuracyPercent: number
     totalVehiclesDiverted: number
     delayMinimizationPercent: number
+    scenario: 'dry' | 'monsoon' | 'cloudburst' | 'flush'
+    rainfallMmHr: number
+    nodes: Array<{
+      id: string
+      name: string
+      depthCm: number
+      pumpRateLps: number
+      pumpMode: 'AUTO' | 'MAX_DISCHARGE' | 'GATE_CLOSED'
+      gateClosed: boolean
+    }>
   }
+  setFloodScenario: (scenario: 'dry' | 'monsoon' | 'cloudburst' | 'flush') => void
+  setFloodNodePumpMode: (nodeId: string, mode: 'AUTO' | 'MAX_DISCHARGE' | 'GATE_CLOSED') => void
+  runFleetScenario: (scenario: 'school_zone' | 'monsoon_pothole' | 'platoon_cruise' | 'cut_in') => void
+
+  // Physical Hardware Bridge (Arduino Uno USB + Laptop Mic Sound Detection)
+  hardwareBridge: HardwareBridgeState
+  connectArduino: () => Promise<void>
+  disconnectArduino: () => Promise<void>
+  setHardwareLed: (color: LedColorCode) => void
+  setAutoSyncLed: (enabled: boolean) => void
+  setHardwareBuzzer: (on: boolean) => void
+  setBuzzerMuted: (muted: boolean) => void
+  setGasThreshold: (pct: number) => void
+  setTouchMode: (mode: HardwareTouchMode) => void
+  startSoundDetector: () => Promise<void>
+  stopSoundDetector: () => void
+  setSoundThreshold: (pct: number) => void
+  injectSimulatedHardwareEvent: (
+    kind: 'gas_spike' | 'gas_clear' | 'touch_press' | 'sound_siren' | 'reset',
+  ) => void
 }
 
 const INITIAL_INTERSECTIONS: Record<IntersectionKey, IntersectionInfo> = {
@@ -376,6 +462,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   // Geolocation
   const [geoLocation, setGeoLocation] = useState<GeoLocationState>(BENGALURU_DEFAULT_COORDS)
+  const [fieldTrail, setFieldTrail] = useState<Array<{ lat: number; lng: number }>>([])
 
   const refreshLocation = useCallback(() => {
     requestNativeLocation(
@@ -415,7 +502,6 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   })
   const [liveVisionLocked, setLiveVisionLocked] = useState(false)
   const [emergencyTrack, setEmergencyTrack] = useState<EmergencyTrack | null>(null)
-  const [fieldTrail, setFieldTrail] = useState<Array<{ lat: number; lng: number }>>([])
   const lastSignalAdaptRef = useRef(0)
   const ambulanceLatchRef = useRef(false)
 
@@ -458,8 +544,51 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     isLinked: false,
     isConnecting: false,
     progress: 0,
-    statusMessage: 'HARDWARE LINK STANDBY (PORT 8000 DISCONNECTED)',
+    statusMessage: 'HARDWARE LINK STANDBY (ARDUINO USB / MIC READY)',
   })
+
+  // Real Arduino Uno (Web Serial USB) + Laptop Mic Sound Bridge
+  const [hardwareBridge, setHardwareBridge] = useState<HardwareBridgeState>(() => ({
+    serialSupported: isWebSerialSupported(),
+    arduinoConnected: false,
+    arduinoConnecting: false,
+    portLabel: 'Not Connected',
+    errorMessage: null,
+    gasRaw: 165,
+    gasPercent: 16,
+    gasThreshold: 55,
+    gasAlertActive: false,
+    touchActive: false,
+    touchMode: 'pedestrian_crosswalk',
+    touchCount: 0,
+    ledColor: 'G',
+    autoSyncLed: true,
+    buzzerOn: false,
+    buzzerMuted: false,
+    micActive: false,
+    micLevel: 0,
+    micPeakHz: 0,
+    sirenScore: 0,
+    soundThreshold: 62,
+    micSpectrum: Array.from({ length: 16 }, () => 4),
+    soundAlertActive: false,
+    lastPacketRaw: '{"gas":165,"touch":0}',
+    logs: [
+      {
+        id: 'HW-INIT',
+        timestamp: 'READY',
+        source: 'OUTPUT',
+        message: 'Arduino Uno USB Serial (A0 Gas, D2 Touch, D8 Buzzer, D9-D11 LEDs) & Mic ready.',
+      },
+    ],
+  }))
+
+  const arduinoRef = useRef<ArduinoSerialClient | null>(null)
+  const acousticRef = useRef<AcousticDetector | null>(null)
+  const hardwareStateRef = useRef(hardwareBridge)
+  useEffect(() => {
+    hardwareStateRef.current = hardwareBridge
+  }, [hardwareBridge])
 
   // Smart Waste
   const [wasteEcosystem, setWasteEcosystem] = useState({
@@ -471,12 +600,64 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   })
 
   // Flood & Underpass Telemetry
-  const [floodTelemetry, setFloodTelemetry] = useState({
+  const [floodTelemetry, setFloodTelemetry] = useState<{
+    underpassDepthCm: number
+    drainagePumpStatus: 'RUNNING' | 'STANDBY' | 'MAX_DISCHARGE'
+    sensorAccuracyPercent: number
+    totalVehiclesDiverted: number
+    delayMinimizationPercent: number
+    scenario: 'dry' | 'monsoon' | 'cloudburst' | 'flush'
+    rainfallMmHr: number
+    nodes: Array<{
+      id: string
+      name: string
+      depthCm: number
+      pumpRateLps: number
+      pumpMode: 'AUTO' | 'MAX_DISCHARGE' | 'GATE_CLOSED'
+      gateClosed: boolean
+    }>
+  }>({
     underpassDepthCm: 18.4,
-    drainagePumpStatus: 'RUNNING' as const,
+    drainagePumpStatus: 'RUNNING',
     sensorAccuracyPercent: 98.7,
     totalVehiclesDiverted: 142,
     delayMinimizationPercent: -38.4,
+    scenario: 'dry',
+    rainfallMmHr: 6,
+    nodes: [
+      {
+        id: 'CAM-FL-01',
+        name: 'Majestic City Railway Underpass',
+        depthCm: 18.4,
+        pumpRateLps: 420,
+        pumpMode: 'AUTO',
+        gateClosed: false,
+      },
+      {
+        id: 'CAM-FL-02',
+        name: 'Koramangala 80ft Storm Canal',
+        depthCm: 22.1,
+        pumpRateLps: 510,
+        pumpMode: 'AUTO',
+        gateClosed: false,
+      },
+      {
+        id: 'CAM-FL-03',
+        name: 'Silk Board South Flyover Incline',
+        depthCm: 14.2,
+        pumpRateLps: 310,
+        pumpMode: 'AUTO',
+        gateClosed: false,
+      },
+      {
+        id: 'CAM-FL-04',
+        name: 'Bellandur Lake Spillway Gate',
+        depthCm: 31.8,
+        pumpRateLps: 680,
+        pumpMode: 'AUTO',
+        gateClosed: false,
+      },
+    ],
   })
 
   // Route Data
@@ -668,12 +849,75 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         }
       })
 
-      // 3. Fluctuating underpass flood depth
+      // 3. Dynamic underpass flood depth simulation based on active scenario & pump modes
       setFloodTelemetry((prev) => {
-        const jitter = (Math.random() - 0.5) * 0.4
+        const inflowByScenario = {
+          dry: 0.08,
+          monsoon: 0.72,
+          cloudburst: 1.65,
+          flush: 0.04,
+        }[prev.scenario]
+
+        let totalDivertedDelta = 0
+        const nextNodes = prev.nodes.map((node, idx) => {
+          const pumpDrain =
+            prev.scenario === 'flush' || node.pumpMode === 'MAX_DISCHARGE'
+              ? 1.55
+              : node.pumpMode === 'GATE_CLOSED'
+                ? 0.95
+                : node.depthCm > 30
+                  ? 0.85
+                  : 0.35
+
+          const canalBias = idx === 3 ? 0.14 : idx === 1 ? 0.08 : 0
+          const jitter = (Math.random() - 0.48) * 0.35
+          const nextDepth = Number(
+            Math.max(8.0, Math.min(64.0, node.depthCm + inflowByScenario + canalBias - pumpDrain + jitter)).toFixed(1),
+          )
+          const gateClosed = node.pumpMode === 'GATE_CLOSED' || nextDepth >= 45.0
+          if (gateClosed && prev.scenario === 'cloudburst') {
+            totalDivertedDelta += 1
+          }
+          const pumpRateLps =
+            prev.scenario === 'flush' || node.pumpMode === 'MAX_DISCHARGE'
+              ? 1250
+              : nextDepth > 30
+                ? 890
+                : 390 + Math.round(nextDepth * 8)
+
+          return {
+            ...node,
+            depthCm: nextDepth,
+            pumpRateLps,
+            gateClosed,
+          }
+        })
+
+        const leadDepth = nextNodes[0]?.depthCm ?? prev.underpassDepthCm
+        const anyCritical = nextNodes.some((n) => n.depthCm >= 38)
+        const drainagePumpStatus =
+          prev.scenario === 'flush' || anyCritical
+            ? 'MAX_DISCHARGE'
+            : prev.scenario === 'dry' && leadDepth < 16
+              ? 'STANDBY'
+              : 'RUNNING'
+
+        const delayMinimizationPercent =
+          prev.scenario === 'cloudburst'
+            ? -46.8
+            : prev.scenario === 'monsoon'
+              ? -41.5
+              : prev.scenario === 'flush'
+                ? -43.2
+                : -38.4
+
         return {
           ...prev,
-          underpassDepthCm: Number(Math.max(12.0, Math.min(48.0, prev.underpassDepthCm + jitter)).toFixed(1)),
+          underpassDepthCm: leadDepth,
+          drainagePumpStatus,
+          totalVehiclesDiverted: prev.totalVehiclesDiverted + totalDivertedDelta,
+          delayMinimizationPercent,
+          nodes: nextNodes,
         }
       })
 
@@ -918,6 +1162,566 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  const clearWasteNode = useCallback((nodeId: string) => {
+    setWasteEcosystem((prev) => {
+      const target = prev.collectionNodes.find((n) => n.id === nodeId)
+      const clearedTons = target ? Number(((target.fillLevelPercent / 100) * (target.capacityKg / 1000)).toFixed(2)) : 0.6
+      const updatedNodes = prev.collectionNodes.map((n) =>
+        n.id === nodeId
+          ? { ...n, fillLevelPercent: 8, lastClearedTime: 'Just now', status: 'Optimal' as const }
+          : n,
+      )
+      const newLog = {
+        id: `LOG-${Date.now()}-${nodeId}`,
+        timestamp: new Date().toLocaleTimeString('en-IN', { hour12: false }),
+        log: `COMPACTOR CLEARED: ${target?.locationName || nodeId} emptied (+${clearedTons}t collected). Route efficiency updated.`,
+      }
+      return {
+        ...prev,
+        collectionNodes: updatedNodes,
+        wasteWeightCollectedTons: Number((prev.wasteWeightCollectedTons + clearedTons).toFixed(1)),
+        routeEfficiencyScore: Number(Math.min(99.2, prev.routeEfficiencyScore + 0.4).toFixed(1)),
+        routingLogs: [newLog, ...prev.routingLogs.slice(0, 9)],
+      }
+    })
+  }, [])
+
+  const dispatchAutoCollectorFleet = useCallback(() => {
+    setWasteEcosystem((prev) => {
+      let clearedCount = 0
+      let addedTons = 0
+      const updatedNodes = prev.collectionNodes.map((n) => {
+        if (n.fillLevelPercent >= 80 || n.status === 'Overflow Flagged' || n.status === 'Missed Pick-up') {
+          clearedCount += 1
+          addedTons += (n.fillLevelPercent / 100) * (n.capacityKg / 1000)
+          return { ...n, fillLevelPercent: 10, lastClearedTime: 'Just now', status: 'Optimal' as const }
+        }
+        return n
+      })
+
+      const newLog = {
+        id: `LOG-${Date.now()}-FLEET`,
+        timestamp: new Date().toLocaleTimeString('en-IN', { hour12: false }),
+        log:
+          clearedCount > 0
+            ? `AI DISPATCH COMPLETE: ${clearedCount} high-priority bins cleared across congested sectors (+${addedTons.toFixed(1)}t). Skipped low-fill bins to save fuel.`
+            : 'AI DISPATCH STANDBY: All monitored smart bins below 80% threshold; zero redundant stops.',
+      }
+
+      return {
+        ...prev,
+        collectionNodes: updatedNodes,
+        wasteWeightCollectedTons: Number((prev.wasteWeightCollectedTons + addedTons).toFixed(1)),
+        routeEfficiencyScore: clearedCount > 0 ? Number(Math.min(99.4, prev.routeEfficiencyScore + 0.8).toFixed(1)) : prev.routeEfficiencyScore,
+        routingLogs: [newLog, ...prev.routingLogs.slice(0, 9)],
+      }
+    })
+  }, [])
+
+  const simulateWasteSurge = useCallback((mode: 'morning' | 'market') => {
+    setWasteEcosystem((prev) => {
+      const updatedNodes = prev.collectionNodes.map((n, idx) => {
+        const delta = mode === 'market' ? (idx % 2 === 0 ? 34 : 22) : 16 + idx * 3
+        const nextFill = Math.min(100, n.fillLevelPercent + delta)
+        const nextStatus: WasteCollectionNode['status'] =
+          nextFill >= 95 ? 'Overflow Flagged' : nextFill >= 80 ? 'Near Capacity' : 'Optimal'
+        return { ...n, fillLevelPercent: nextFill, status: nextStatus }
+      })
+      const newLog = {
+        id: `LOG-${Date.now()}-${mode}`,
+        timestamp: new Date().toLocaleTimeString('en-IN', { hour12: false }),
+        log:
+          mode === 'market'
+            ? 'SURGE SIMULATION: Festival & commercial market waste surge injected. High-fill alerts active.'
+            : 'SURGE SIMULATION: Morning commercial waste accumulation sweep applied across 5 urban zones.',
+      }
+      return {
+        ...prev,
+        collectionNodes: updatedNodes,
+        routeEfficiencyScore: Number(Math.max(84.0, prev.routeEfficiencyScore - 1.2).toFixed(1)),
+        routingLogs: [newLog, ...prev.routingLogs.slice(0, 9)],
+      }
+    })
+  }, [])
+
+  const tickWasteAutoFill = useCallback(() => {
+    setWasteEcosystem((prev) => {
+      const updatedNodes = prev.collectionNodes.map((n) => {
+        const inc = Math.floor(2 + Math.random() * 6)
+        const nextFill = Math.min(100, n.fillLevelPercent + inc)
+        const nextStatus: WasteCollectionNode['status'] =
+          n.status === 'Missed Pick-up'
+            ? 'Missed Pick-up'
+            : nextFill >= 95
+              ? 'Overflow Flagged'
+              : nextFill >= 80
+                ? 'Near Capacity'
+                : 'Optimal'
+        return { ...n, fillLevelPercent: nextFill, status: nextStatus }
+      })
+      return { ...prev, collectionNodes: updatedNodes }
+    })
+  }, [])
+
+  const setFloodScenario = useCallback((scenario: 'dry' | 'monsoon' | 'cloudburst' | 'flush') => {
+    setFloodTelemetry((prev) => {
+      const rainfallMap = { dry: 4, monsoon: 38, cloudburst: 85, flush: 8 }
+      const nodes = prev.nodes.map((n, idx) => {
+        if (scenario === 'cloudburst') {
+          const spike = Number(Math.min(54, Math.max(n.depthCm + 16, 36 + idx * 4.2)).toFixed(1))
+          return { ...n, depthCm: spike, pumpMode: 'MAX_DISCHARGE' as const, gateClosed: spike >= 45 }
+        }
+        if (scenario === 'monsoon') {
+          const rise = Number(Math.min(41, Math.max(n.depthCm + 7, 25 + idx * 2.5)).toFixed(1))
+          return { ...n, depthCm: rise, pumpMode: 'AUTO' as const, gateClosed: false }
+        }
+        if (scenario === 'flush') {
+          return { ...n, pumpMode: 'MAX_DISCHARGE' as const, gateClosed: n.depthCm >= 45 }
+        }
+        return {
+          ...n,
+          depthCm: [16.2, 20.4, 13.8, 24.5][idx] ?? 18,
+          pumpMode: 'AUTO' as const,
+          gateClosed: false,
+        }
+      })
+      return {
+        ...prev,
+        scenario,
+        rainfallMmHr: rainfallMap[scenario],
+        drainagePumpStatus: scenario === 'cloudburst' || scenario === 'flush' ? 'MAX_DISCHARGE' : 'RUNNING',
+        nodes,
+      }
+    })
+  }, [])
+
+  const setFloodNodePumpMode = useCallback(
+    (nodeId: string, mode: 'AUTO' | 'MAX_DISCHARGE' | 'GATE_CLOSED') => {
+      setFloodTelemetry((prev) => ({
+        ...prev,
+        nodes: prev.nodes.map((n) =>
+          n.id === nodeId
+            ? {
+                ...n,
+                pumpMode: mode,
+                gateClosed: mode === 'GATE_CLOSED' || n.depthCm >= 45,
+              }
+            : n,
+        ),
+      }))
+    },
+    [],
+  )
+
+  const runFleetScenario = useCallback(
+    (scenario: 'school_zone' | 'monsoon_pothole' | 'platoon_cruise' | 'cut_in') => {
+      if (scenario === 'school_zone') {
+        setIsVulnerablePedestrianPresent(true)
+        setTelemetry({
+          egoSpeedKmh: 28.0,
+          distanceM: 12.5,
+          closingVelMs: 5.2,
+          ttcSec: 2.4,
+          obstacle: 'pedestrian',
+          state: 'YIELD',
+        })
+      } else if (scenario === 'monsoon_pothole') {
+        setIsVulnerablePedestrianPresent(false)
+        setTelemetry({
+          egoSpeedKmh: 56.0,
+          distanceM: 15.0,
+          closingVelMs: 8.4,
+          ttcSec: 1.79,
+          obstacle: 'pothole',
+          state: 'AVOID',
+        })
+      } else if (scenario === 'cut_in') {
+        setTelemetry({
+          egoSpeedKmh: 68.0,
+          distanceM: 9.5,
+          closingVelMs: 11.5,
+          ttcSec: 0.83,
+          obstacle: 'vehicle',
+          state: 'EMERGENCY_BRAKE',
+        })
+      } else {
+        setIsVulnerablePedestrianPresent(false)
+        setTelemetry({
+          egoSpeedKmh: 48.5,
+          distanceM: 22.0,
+          closingVelMs: 3.1,
+          ttcSec: 7.1,
+          obstacle: 'none',
+          state: 'FOLLOW',
+        })
+      }
+    },
+    [],
+  )
+
+  // Hardware Bridge Helpers & Actions
+  const appendHardwareLog = useCallback(
+    (source: HardwareLogEntry['source'], message: string) => {
+      const entry: HardwareLogEntry = {
+        id: `HW-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date().toLocaleTimeString('en-IN', { hour12: false }),
+        source,
+        message,
+      }
+      setHardwareBridge((prev) => ({
+        ...prev,
+        logs: [entry, ...prev.logs.slice(0, 19)],
+      }))
+    },
+    [],
+  )
+
+  const pushOutputToArduino = useCallback(
+    (led: LedColorCode, buzzer: boolean) => {
+      const effectiveBuzzer = buzzer && !hardwareStateRef.current.buzzerMuted
+      if (arduinoRef.current && hardwareStateRef.current.arduinoConnected) {
+        void arduinoRef.current.sendSignalLed(led)
+        void arduinoRef.current.sendBuzzer(effectiveBuzzer)
+      }
+      setHardwareBridge((prev) => ({
+        ...prev,
+        ledColor: led,
+        buzzerOn: effectiveBuzzer,
+      }))
+    },
+    [],
+  )
+
+  const gasLatchRef = useRef(false)
+  const touchLatchRef = useRef(false)
+  const soundLatchRef = useRef(0)
+
+  const handleTouchTriggered = useCallback(() => {
+    const mode = hardwareStateRef.current.touchMode
+    if (mode === 'pedestrian_crosswalk') {
+      setIsVulnerablePedestrianPresent(true)
+      triggerPedestrianWalkway()
+      if (hardwareStateRef.current.autoSyncLed) {
+        pushOutputToArduino('R', false)
+      }
+      appendHardwareLog(
+        'ARDUINO',
+        'Touch Sensor D2 triggered -> +15s Pedestrian Buffer ACTIVE, AV FSM -> YIELD, Red LED ON.',
+      )
+    } else {
+      simulateSirenEvent('Silk Board')
+      if (hardwareStateRef.current.autoSyncLed) {
+        pushOutputToArduino('G', true)
+      }
+      appendHardwareLog(
+        'ARDUINO',
+        'Touch Sensor D2 triggered SOS -> Emergency Green Wave ON, Green LED & Buzzer active.',
+      )
+    }
+  }, [appendHardwareLog, pushOutputToArduino, simulateSirenEvent, triggerPedestrianWalkway])
+
+  const processArduinoPacket = useCallback(
+    (packet: ArduinoSensorPacket) => {
+      const rawGas = typeof packet.gas === 'number' ? Math.max(0, Math.min(1023, packet.gas)) : hardwareStateRef.current.gasRaw
+      const gasPct = Math.round((rawGas / 1023) * 100)
+      const touchVal = typeof packet.touch === 'number' ? packet.touch > 0 : hardwareStateRef.current.touchActive
+      const gasTripped = gasPct >= hardwareStateRef.current.gasThreshold
+
+      setHardwareBridge((prev) => ({
+        ...prev,
+        gasRaw: rawGas,
+        gasPercent: gasPct,
+        gasAlertActive: gasTripped,
+        touchActive: touchVal,
+        touchCount: touchVal && !touchLatchRef.current ? prev.touchCount + 1 : prev.touchCount,
+        lastPacketRaw: packet.rawLine || JSON.stringify({ gas: rawGas, touch: touchVal ? 1 : 0 }),
+      }))
+
+      // Edge-triggered Gas Hazard -> Flag Smart Waste Overflow + Red LED + Buzzer
+      if (gasTripped && !gasLatchRef.current) {
+        gasLatchRef.current = true
+        flagWasteOverflow('BIN-101')
+        if (hardwareStateRef.current.autoSyncLed) {
+          pushOutputToArduino('R', true)
+        }
+        appendHardwareLog(
+          'ARDUINO',
+          `Gas Sensor A0 alert (${gasPct}% ≥ ${hardwareStateRef.current.gasThreshold}%) -> Flagged BIN-101 Overflow, Red LED + Buzzer ON.`,
+        )
+      } else if (!gasTripped && gasLatchRef.current) {
+        gasLatchRef.current = false
+        if (hardwareStateRef.current.autoSyncLed) {
+          pushOutputToArduino('G', false)
+        }
+        appendHardwareLog('ARDUINO', `Gas Sensor A0 normalized (${gasPct}%) -> Buzzer cleared, Green LED restored.`)
+      }
+
+      // Edge-triggered Touch Sensor D2
+      if (touchVal && !touchLatchRef.current) {
+        touchLatchRef.current = true
+        handleTouchTriggered()
+      } else if (!touchVal && touchLatchRef.current) {
+        touchLatchRef.current = false
+      }
+    },
+    [appendHardwareLog, flagWasteOverflow, handleTouchTriggered, pushOutputToArduino],
+  )
+
+  const connectArduino = useCallback(async () => {
+    if (hardwareStateRef.current.arduinoConnected || hardwareStateRef.current.arduinoConnecting) return
+    setHardwareBridge((prev) => ({ ...prev, arduinoConnecting: true, errorMessage: null }))
+    try {
+      const client = new ArduinoSerialClient()
+      arduinoRef.current = client
+      const label = await client.connect(
+        (pkt) => processArduinoPacket(pkt),
+        (reason) => {
+          setHardwareBridge((prev) => ({
+            ...prev,
+            arduinoConnected: false,
+            arduinoConnecting: false,
+            portLabel: 'Disconnected',
+            errorMessage: reason || 'USB connection closed',
+          }))
+          setHardwareLink({
+            isLinked: false,
+            isConnecting: false,
+            progress: 0,
+            statusMessage: 'ARDUINO UNO USB DISCONNECTED',
+          })
+          appendHardwareLog('ARDUINO', `USB disconnected: ${reason || 'port closed'}`)
+        },
+      )
+
+      setHardwareBridge((prev) => ({
+        ...prev,
+        arduinoConnected: true,
+        arduinoConnecting: false,
+        portLabel: label,
+        errorMessage: null,
+      }))
+      setHardwareLink({
+        isLinked: true,
+        isConnecting: false,
+        progress: 100,
+        statusMessage: `ARDUINO UNO CONNECTED (${label})`,
+      })
+      appendHardwareLog('ARDUINO', `Connected to ${label}. Streaming A0/D2 sensors & syncing D8-D11 LEDs/Buzzer.`)
+      await client.sendSignalLed(hardwareStateRef.current.ledColor)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to open Arduino USB Serial port'
+      setHardwareBridge((prev) => ({
+        ...prev,
+        arduinoConnected: false,
+        arduinoConnecting: false,
+        errorMessage: msg,
+      }))
+      appendHardwareLog('ARDUINO', `Connection canceled/failed: ${msg}`)
+    }
+  }, [appendHardwareLog, processArduinoPacket])
+
+  const disconnectArduino = useCallback(async () => {
+    await arduinoRef.current?.disconnect()
+    arduinoRef.current = null
+    setHardwareBridge((prev) => ({
+      ...prev,
+      arduinoConnected: false,
+      arduinoConnecting: false,
+      portLabel: 'Not Connected',
+    }))
+    setHardwareLink({
+      isLinked: hardwareStateRef.current.micActive,
+      isConnecting: false,
+      progress: hardwareStateRef.current.micActive ? 100 : 0,
+      statusMessage: hardwareStateRef.current.micActive
+        ? 'LAPTOP MIC SOUND DETECTOR ACTIVE'
+        : 'HARDWARE LINK STANDBY (ARDUINO USB / MIC READY)',
+    })
+    appendHardwareLog('ARDUINO', 'Arduino Uno USB Serial disconnected.')
+  }, [appendHardwareLog])
+
+  const setHardwareLed = useCallback(
+    (color: LedColorCode) => {
+      if (arduinoRef.current && hardwareStateRef.current.arduinoConnected) {
+        void arduinoRef.current.sendSignalLed(color)
+      }
+      setHardwareBridge((prev) => ({ ...prev, ledColor: color }))
+      appendHardwareLog('OUTPUT', `Traffic Signal LED set to ${color === 'G' ? 'GREEN (D11)' : color === 'Y' ? 'YELLOW (D10)' : 'RED (D9)'}.`)
+    },
+    [appendHardwareLog],
+  )
+
+  const setAutoSyncLed = useCallback((enabled: boolean) => {
+    setHardwareBridge((prev) => ({ ...prev, autoSyncLed: enabled }))
+  }, [])
+
+  const setHardwareBuzzer = useCallback(
+    (on: boolean) => {
+      const effective = on && !hardwareStateRef.current.buzzerMuted
+      if (arduinoRef.current && hardwareStateRef.current.arduinoConnected) {
+        void arduinoRef.current.sendBuzzer(effective)
+      }
+      setHardwareBridge((prev) => ({ ...prev, buzzerOn: effective }))
+      appendHardwareLog('OUTPUT', `Physical Buzzer D8 turned ${effective ? 'ON' : 'OFF'}.`)
+    },
+    [appendHardwareLog],
+  )
+
+  const setBuzzerMuted = useCallback((muted: boolean) => {
+    if (muted && arduinoRef.current && hardwareStateRef.current.arduinoConnected) {
+      void arduinoRef.current.sendBuzzer(false)
+    }
+    setHardwareBridge((prev) => ({
+      ...prev,
+      buzzerMuted: muted,
+      buzzerOn: muted ? false : prev.buzzerOn,
+    }))
+  }, [])
+
+  const setGasThreshold = useCallback((pct: number) => {
+    setHardwareBridge((prev) => ({ ...prev, gasThreshold: pct }))
+  }, [])
+
+  const setTouchMode = useCallback((mode: HardwareTouchMode) => {
+    setHardwareBridge((prev) => ({ ...prev, touchMode: mode }))
+  }, [])
+
+  const setSoundThreshold = useCallback((pct: number) => {
+    setHardwareBridge((prev) => ({ ...prev, soundThreshold: pct }))
+  }, [])
+
+  const startSoundDetector = useCallback(async () => {
+    if (hardwareStateRef.current.micActive) return
+    try {
+      const detector = new AcousticDetector()
+      acousticRef.current = detector
+      await detector.start((frame) => {
+        const thresh = hardwareStateRef.current.soundThreshold
+        const triggered = frame.sirenScore >= thresh || frame.levelPercent >= thresh + 12
+
+        setHardwareBridge((prev) => ({
+          ...prev,
+          micActive: true,
+          micLevel: frame.levelPercent,
+          micPeakHz: frame.peakHz,
+          sirenScore: frame.sirenScore,
+          micSpectrum: frame.spectrum,
+          soundAlertActive: triggered,
+        }))
+
+        const now = Date.now()
+        if (triggered && now - soundLatchRef.current > 5000) {
+          soundLatchRef.current = now
+          simulateSirenEvent('Silk Board')
+          if (hardwareStateRef.current.autoSyncLed) {
+            pushOutputToArduino('G', true)
+            window.setTimeout(() => {
+              if (!hardwareStateRef.current.gasAlertActive) {
+                pushOutputToArduino('G', false)
+              }
+            }, 2200)
+          }
+          appendHardwareLog(
+            'SOUND',
+            `Acoustic trigger (${frame.classification}, ${frame.peakHz} Hz, siren ${frame.sirenScore}%) -> Emergency Green Wave & Buzzer!`,
+          )
+        }
+      })
+
+      setHardwareBridge((prev) => ({ ...prev, micActive: true, errorMessage: null }))
+      setHardwareLink({
+        isLinked: true,
+        isConnecting: false,
+        progress: 100,
+        statusMessage: hardwareStateRef.current.arduinoConnected
+          ? `ARDUINO USB + MIC SOUND ACTIVE`
+          : 'LAPTOP MIC SOUND DETECTOR ACTIVE',
+      })
+      appendHardwareLog('SOUND', 'Laptop microphone acoustic & siren-band (650–1450 Hz) detector started.')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Microphone permission denied'
+      setHardwareBridge((prev) => ({ ...prev, micActive: false, errorMessage: msg }))
+      appendHardwareLog('SOUND', `Microphone start failed: ${msg}`)
+    }
+  }, [appendHardwareLog, pushOutputToArduino, simulateSirenEvent])
+
+  const stopSoundDetector = useCallback(() => {
+    acousticRef.current?.stop()
+    acousticRef.current = null
+    setHardwareBridge((prev) => ({
+      ...prev,
+      micActive: false,
+      micLevel: 0,
+      micPeakHz: 0,
+      sirenScore: 0,
+      soundAlertActive: false,
+      micSpectrum: Array.from({ length: 16 }, () => 4),
+    }))
+    if (!hardwareStateRef.current.arduinoConnected) {
+      setHardwareLink({
+        isLinked: false,
+        isConnecting: false,
+        progress: 0,
+        statusMessage: 'HARDWARE LINK STANDBY (ARDUINO USB / MIC READY)',
+      })
+    }
+    appendHardwareLog('SOUND', 'Laptop microphone sound detector stopped.')
+  }, [appendHardwareLog])
+
+  const injectSimulatedHardwareEvent = useCallback(
+    (kind: 'gas_spike' | 'gas_clear' | 'touch_press' | 'sound_siren' | 'reset') => {
+      if (kind === 'gas_spike') {
+        processArduinoPacket({ gas: 820, touch: 0, rawLine: '{"gas":820,"touch":0}' })
+      } else if (kind === 'gas_clear') {
+        processArduinoPacket({ gas: 165, touch: 0, rawLine: '{"gas":165,"touch":0}' })
+      } else if (kind === 'touch_press') {
+        processArduinoPacket({ gas: hardwareStateRef.current.gasRaw, touch: 1, rawLine: '{"gas":165,"touch":1}' })
+        window.setTimeout(() => {
+          touchLatchRef.current = false
+          setHardwareBridge((prev) => ({ ...prev, touchActive: false }))
+        }, 900)
+      } else if (kind === 'sound_siren') {
+        setHardwareBridge((prev) => ({
+          ...prev,
+          micLevel: 84,
+          micPeakHz: 880,
+          sirenScore: 91,
+          soundAlertActive: true,
+          micSpectrum: [24, 38, 62, 88, 95, 76, 52, 34, 28, 22, 18, 15, 12, 10, 8, 6],
+        }))
+        simulateSirenEvent('Silk Board')
+        if (hardwareStateRef.current.autoSyncLed) {
+          pushOutputToArduino('G', true)
+        }
+        appendHardwareLog('SOUND', 'Simulated 880 Hz siren -> Emergency Green Wave & Buzzer triggered.')
+      } else {
+        gasLatchRef.current = false
+        touchLatchRef.current = false
+        clearSirenEvent()
+        resetTelemetry()
+        pushOutputToArduino('G', false)
+        setHardwareBridge((prev) => ({
+          ...prev,
+          gasRaw: 165,
+          gasPercent: 16,
+          gasAlertActive: false,
+          touchActive: false,
+          soundAlertActive: false,
+          sirenScore: 0,
+        }))
+        appendHardwareLog('OUTPUT', 'Hardware sensors & alerts reset to nominal standby.')
+      }
+    },
+    [appendHardwareLog, clearSirenEvent, processArduinoPacket, pushOutputToArduino, resetTelemetry, simulateSirenEvent],
+  )
+
+  useEffect(() => {
+    return () => {
+      void arduinoRef.current?.disconnect()
+      acousticRef.current?.stop()
+    }
+  }, [])
+
   const value = useMemo<DashboardContextType>(
     () => ({
       activeTab,
@@ -957,7 +1761,27 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       wasteEcosystem,
       reportMissedPickup,
       flagWasteOverflow,
+      clearWasteNode,
+      dispatchAutoCollectorFleet,
+      simulateWasteSurge,
+      tickWasteAutoFill,
       floodTelemetry,
+      setFloodScenario,
+      setFloodNodePumpMode,
+      runFleetScenario,
+      hardwareBridge,
+      connectArduino,
+      disconnectArduino,
+      setHardwareLed,
+      setAutoSyncLed,
+      setHardwareBuzzer,
+      setBuzzerMuted,
+      setGasThreshold,
+      setTouchMode,
+      startSoundDetector,
+      stopSoundDetector,
+      setSoundThreshold,
+      injectSimulatedHardwareEvent,
     }),
     [
       activeTab,
@@ -994,7 +1818,27 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       wasteEcosystem,
       reportMissedPickup,
       flagWasteOverflow,
+      clearWasteNode,
+      dispatchAutoCollectorFleet,
+      simulateWasteSurge,
+      tickWasteAutoFill,
       floodTelemetry,
+      setFloodScenario,
+      setFloodNodePumpMode,
+      runFleetScenario,
+      hardwareBridge,
+      connectArduino,
+      disconnectArduino,
+      setHardwareLed,
+      setAutoSyncLed,
+      setHardwareBuzzer,
+      setBuzzerMuted,
+      setGasThreshold,
+      setTouchMode,
+      startSoundDetector,
+      stopSoundDetector,
+      setSoundThreshold,
+      injectSimulatedHardwareEvent,
     ],
   )
 

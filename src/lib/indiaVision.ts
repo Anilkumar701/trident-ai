@@ -40,7 +40,7 @@ export function classifyIndiaTrafficBlob(blob: {
 }): VisionClass {
   const aspect = blob.height / Math.max(1, blob.width)
   const area = blob.area
-  const redHeavy = blob.meanRed > 145 && blob.meanRed > 0
+  const redHeavy = blob.meanRed > 145
 
   if (redHeavy && area > 2200 && blob.width > 40) {
     return 'ambulance'

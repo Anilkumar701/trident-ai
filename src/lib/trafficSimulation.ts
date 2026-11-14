@@ -154,6 +154,96 @@ export function overrideSignal(
   }
 }
 
+export type SignalControlStrategy = 'fixed' | 'webster_ai' | 'v2x_emergency' | 'green_wave'
+
+export interface StrategyAdvanceResult {
+  signal: SignalState
+  decisionNote?: string
+}
+
+export function advanceSignalWithStrategy(
+  signal: SignalState,
+  context: {
+    nsQueue: number
+    ewQueue: number
+    emergencyNS: boolean
+    emergencyEW: boolean
+    strategy: SignalControlStrategy
+  },
+  deltaSec: number,
+): SignalState {
+  if (deltaSec <= 0) return signal
+
+  // V2X Emergency Preemption snaps active emergency corridor to green immediately
+  if (context.strategy === 'v2x_emergency' || context.emergencyNS || context.emergencyEW) {
+    if (context.emergencyNS && signal.nsColor !== 'green') {
+      return overrideSignal(signal, 'NS', 10)
+    }
+    if (context.emergencyEW && signal.ewColor !== 'green') {
+      return overrideSignal(signal, 'EW', 10)
+    }
+  }
+
+  if (context.strategy === 'fixed') {
+    return advanceSignal(signal, deltaSec)
+  }
+
+  if (context.strategy === 'green_wave') {
+    const adjusted: SignalState = {
+      ...signal,
+      greenDuration: signal.ewColor === 'green' ? 16 : 9,
+    }
+    return advanceSignal(adjusted, deltaSec)
+  }
+
+  // AI Adaptive Webster timing: shorten empty approaches and extend heavy queues
+  if (signal.isOverridden) {
+    return advanceSignal(signal, deltaSec)
+  }
+
+  const nsActive = signal.nsColor === 'green'
+  const ewActive = signal.ewColor === 'green'
+  const activeQueue = nsActive ? context.nsQueue : ewActive ? context.ewQueue : 1
+  const crossQueue = nsActive ? context.ewQueue : ewActive ? context.nsQueue : 1
+
+  // Early phase cut-off if active lane is empty while cross lane has waiting vehicles
+  if ((nsActive || ewActive) && activeQueue === 0 && crossQueue >= 2 && signal.timer > 2.2) {
+    return advanceSignal({ ...signal, timer: 1.0 }, deltaSec)
+  }
+
+  const adaptiveGreen = Math.min(20, Math.max(7, 9 + Math.round((activeQueue - crossQueue) * 1.4)))
+  return advanceSignal({ ...signal, greenDuration: adaptiveGreen }, deltaSec)
+}
+
+/**
+ * Selects the next road segment at an intersection.
+ * Under AI strategies, vehicles avoid hazardous or heavily congested corridors.
+ */
+export function chooseNextRoad(
+  candidates: GridRoad[],
+  roadLoads: Map<string, number>,
+  strategy: SignalControlStrategy,
+  isEmergency: boolean,
+): GridRoad | undefined {
+  if (candidates.length === 0) return undefined
+  if (strategy === 'fixed' && !isEmergency) {
+    return candidates[Math.floor(Math.random() * candidates.length)]
+  }
+
+  let best = candidates[0]
+  let bestScore = Infinity
+  for (const road of candidates) {
+    const load = roadLoads.get(road.id) ?? 0
+    const hazardCost = road.hazard ? road.hazard.penalty * 14 : 0
+    const score = load * 2.2 + hazardCost + Math.random() * 0.8
+    if (score < bestScore) {
+      bestScore = score
+      best = road
+    }
+  }
+  return best
+}
+
 /**
  * Calculates vehicle deceleration and stopping behavior at signal / obstacle
  */

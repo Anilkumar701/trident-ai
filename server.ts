@@ -3,9 +3,9 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import dotenv from 'dotenv';
-import { db } from './src/db/index.ts';
+import { db, isDatabaseConfigured } from './src/db/index.ts';
 import { users, citizenReports, trafficIncidents } from './src/db/schema.ts';
 import { requireAuth, optionalAuth, type AuthenticatedRequest } from './src/middleware/auth.ts';
 import { desc, eq } from 'drizzle-orm';
@@ -16,8 +16,56 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+interface MemoryReport {
+  id: string;
+  trackingId: string;
+  userId: string | null;
+  category: string;
+  department: string;
+  severity: string;
+  status: string;
+  latitude: string | null;
+  longitude: string | null;
+  address: string | null;
+  description: string;
+  imageUrl: string | null;
+  createdAt: Date;
+}
+
+interface MemoryIncident {
+  id: string;
+  intersectionId: string;
+  intersectionName: string;
+  status: string;
+  vehicleCount: number;
+  ambulanceDetected: boolean;
+  reportedBy: string | null;
+  createdAt: Date;
+}
+
+const memoryUsers = new Map<string, { id: string; email: string | null; displayName: string | null; photoUrl: string | null; createdAt: Date; updatedAt: Date }>();
+const memoryReports: MemoryReport[] = [];
+const memoryIncidents: MemoryIncident[] = [];
+let dbOffline = !isDatabaseConfigured;
+
+function markDbOffline() {
+  if (!dbOffline) {
+    dbOffline = true;
+    console.log('[AI Studio] Database unreachable — switching to in-memory fallback store');
+  }
+}
+
 function startYoloService() {
   const python = process.platform === 'win32' ? 'python' : 'python3';
+  const check = spawnSync(python, ['-c', 'import flask, ultralytics, cv2'], {
+    cwd: __dirname,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  if (check.status !== 0) {
+    console.log('[AI Studio] YOLO Python dependencies unavailable — running with local CV fallback');
+    return null;
+  }
   const child = spawn(python, ['yolo_service.py'], {
     cwd: __dirname,
     stdio: 'inherit',
@@ -78,12 +126,25 @@ async function startServer() {
   app.use(express.json({ limit: '10mb' }));
 
   // API Routes
-  // Sync authenticated user to Cloud SQL database
+  // Sync authenticated user to Cloud SQL database (with in-memory fallback)
   app.post('/api/auth/sync-user', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const user = req.user!;
-      const { displayName, photoUrl } = req.body;
+    const user = req.user!;
+    const { displayName, photoUrl } = req.body;
 
+    if (dbOffline) {
+      const existing = memoryUsers.get(user.uid);
+      memoryUsers.set(user.uid, {
+        id: user.uid,
+        email: user.email || null,
+        displayName: displayName || user.name || null,
+        photoUrl: photoUrl || user.picture || null,
+        createdAt: existing?.createdAt ?? new Date(),
+        updatedAt: new Date(),
+      });
+      return res.json({ success: true, uid: user.uid, storage: 'memory' });
+    }
+
+    try {
       const existingUser = await db.select().from(users).where(eq(users.id, user.uid)).limit(1);
 
       if (existingUser.length > 0) {
@@ -108,14 +169,26 @@ async function startServer() {
       }
 
       return res.json({ success: true, uid: user.uid });
-    } catch (error) {
-      console.error('Error syncing user to database:', error);
-      return res.status(500).json({ error: 'Failed to sync user' });
+    } catch {
+      markDbOffline();
+      const existing = memoryUsers.get(user.uid);
+      memoryUsers.set(user.uid, {
+        id: user.uid,
+        email: user.email || null,
+        displayName: displayName || user.name || null,
+        photoUrl: photoUrl || user.picture || null,
+        createdAt: existing?.createdAt ?? new Date(),
+        updatedAt: new Date(),
+      });
+      return res.json({ success: true, uid: user.uid, storage: 'memory' });
     }
   });
 
-  // Fetch citizen reports from Cloud SQL
+  // Fetch citizen reports from Cloud SQL (with in-memory fallback)
   app.get('/api/reports', optionalAuth, async (_req, res) => {
+    if (dbOffline) {
+      return res.json(memoryReports.slice(0, 50));
+    }
     try {
       const reports = await db
         .select()
@@ -123,55 +196,64 @@ async function startServer() {
         .orderBy(desc(citizenReports.createdAt))
         .limit(50);
       return res.json(reports);
-    } catch (error) {
-      console.error('Error fetching reports from database:', error);
-      return res.status(500).json({ error: 'Failed to fetch reports' });
+    } catch {
+      markDbOffline();
+      return res.json(memoryReports.slice(0, 50));
     }
   });
 
-  // Submit citizen hazard report to Cloud SQL
+  // Submit citizen hazard report to Cloud SQL (with in-memory fallback)
   app.post('/api/reports', optionalAuth, async (req: AuthenticatedRequest, res) => {
+    const {
+      trackingId,
+      category,
+      department,
+      severity,
+      status,
+      latitude,
+      longitude,
+      address,
+      description,
+      imageUrl,
+    } = req.body;
+
+    const reportId = crypto.randomUUID();
+    const newReport: MemoryReport = {
+      id: reportId,
+      trackingId: trackingId || `TRK-${Date.now().toString().slice(-6)}`,
+      userId: req.user?.uid || null,
+      category: category || 'Citizen Hazard',
+      department: department || 'Municipal Engineering Bureau',
+      severity: severity || 'High',
+      status: status || 'Dispatched',
+      latitude: latitude ? String(latitude) : null,
+      longitude: longitude ? String(longitude) : null,
+      address: address || 'Bangalore Urban Sector',
+      description: description || 'Reported hazard at urban node.',
+      imageUrl: imageUrl || null,
+      createdAt: new Date(),
+    };
+
+    if (dbOffline) {
+      memoryReports.unshift(newReport);
+      return res.status(201).json(newReport);
+    }
+
     try {
-      const {
-        trackingId,
-        category,
-        department,
-        severity,
-        status,
-        latitude,
-        longitude,
-        address,
-        description,
-        imageUrl,
-      } = req.body;
-
-      const reportId = crypto.randomUUID();
-      const newReport = {
-        id: reportId,
-        trackingId: trackingId || `TRK-${Date.now().toString().slice(-6)}`,
-        userId: req.user?.uid || null,
-        category: category || 'Citizen Hazard',
-        department: department || 'Municipal Engineering Bureau',
-        severity: severity || 'High',
-        status: status || 'Dispatched',
-        latitude: latitude ? String(latitude) : null,
-        longitude: longitude ? String(longitude) : null,
-        address: address || 'Bangalore Urban Sector',
-        description: description || 'Reported hazard at urban node.',
-        imageUrl: imageUrl || null,
-        createdAt: new Date(),
-      };
-
       await db.insert(citizenReports).values(newReport);
       return res.status(201).json(newReport);
-    } catch (error) {
-      console.error('Error creating report in database:', error);
-      return res.status(500).json({ error: 'Failed to create report' });
+    } catch {
+      markDbOffline();
+      memoryReports.unshift(newReport);
+      return res.status(201).json(newReport);
     }
   });
 
-  // Fetch traffic incident logs from Cloud SQL
+  // Fetch traffic incident logs from Cloud SQL (with in-memory fallback)
   app.get('/api/traffic/incidents', async (_req, res) => {
+    if (dbOffline) {
+      return res.json(memoryIncidents.slice(0, 20));
+    }
     try {
       const incidents = await db
         .select()
@@ -179,39 +261,49 @@ async function startServer() {
         .orderBy(desc(trafficIncidents.createdAt))
         .limit(20);
       return res.json(incidents);
-    } catch (error) {
-      console.error('Error fetching traffic incidents:', error);
-      return res.status(500).json({ error: 'Failed to fetch incidents' });
+    } catch {
+      markDbOffline();
+      return res.json(memoryIncidents.slice(0, 20));
     }
   });
 
-  // Record traffic incident or emergency override in Cloud SQL
+  // Record traffic incident or emergency override in Cloud SQL (with in-memory fallback)
   app.post('/api/traffic/incidents', optionalAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const { intersectionId, intersectionName, status, vehicleCount, ambulanceDetected } = req.body;
-      const incidentId = crypto.randomUUID();
-      const newIncident = {
-        id: incidentId,
-        intersectionId: intersectionId || 'INT-01',
-        intersectionName: intersectionName || 'MG Road Intersection',
-        status: status || 'EMERGENCY_GREEN',
-        vehicleCount: typeof vehicleCount === 'number' ? vehicleCount : 0,
-        ambulanceDetected: Boolean(ambulanceDetected),
-        reportedBy: req.user?.uid || null,
-        createdAt: new Date(),
-      };
+    const { intersectionId, intersectionName, status, vehicleCount, ambulanceDetected } = req.body;
+    const incidentId = crypto.randomUUID();
+    const newIncident: MemoryIncident = {
+      id: incidentId,
+      intersectionId: intersectionId || 'INT-01',
+      intersectionName: intersectionName || 'MG Road Intersection',
+      status: status || 'EMERGENCY_GREEN',
+      vehicleCount: typeof vehicleCount === 'number' ? vehicleCount : 0,
+      ambulanceDetected: Boolean(ambulanceDetected),
+      reportedBy: req.user?.uid || null,
+      createdAt: new Date(),
+    };
 
+    if (dbOffline) {
+      memoryIncidents.unshift(newIncident);
+      return res.status(201).json(newIncident);
+    }
+
+    try {
       await db.insert(trafficIncidents).values(newIncident);
       return res.status(201).json(newIncident);
-    } catch (error) {
-      console.error('Error recording traffic incident:', error);
-      return res.status(500).json({ error: 'Failed to record incident' });
+    } catch {
+      markDbOffline();
+      memoryIncidents.unshift(newIncident);
+      return res.status(201).json(newIncident);
     }
   });
 
   // Health check endpoint
   app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'Metropolis-AI Core', database: 'Cloud SQL PostgreSQL' });
+    res.json({
+      status: 'ok',
+      service: 'Metropolis-AI Core',
+      database: dbOffline ? 'In-Memory Fallback' : 'Cloud SQL PostgreSQL',
+    });
   });
 
   // Vite middleware in dev or static serve in prod

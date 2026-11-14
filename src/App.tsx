@@ -66,6 +66,10 @@ function AppShellContent() {
       title: 'Flood & Video Analytics Monitor',
       subtitle: 'YOLOv8 RTSP neural frame telemetry & conflict rate reduction',
     },
+    hardware: {
+      title: 'Arduino & Sensor Hardware Bridge',
+      subtitle: 'USB Serial Arduino Uno (Gas, Touch, 3-Color LEDs, Buzzer) + Laptop Cam & Sound',
+    },
   }
 
   const currentSector = sectorTitles[activeTab] || sectorTitles.traffic

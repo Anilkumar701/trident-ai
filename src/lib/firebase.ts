@@ -10,8 +10,11 @@ export async function signInWithGoogle() {
   try {
     const result = await signInWithPopup(auth, googleProvider);
     return result.user;
-  } catch (error) {
-    console.error('Error signing in with Google:', error);
+  } catch (error: unknown) {
+    const code = (error as { code?: string })?.code;
+    if (code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
+      console.warn('Google sign-in failed:', code || error);
+    }
     throw error;
   }
 }
